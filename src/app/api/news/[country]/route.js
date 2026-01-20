@@ -1,9 +1,18 @@
 import { NextResponse } from "next/server";
+import clientPromise from "@/lib/mongodb";
 
 export async function GET(request, { params }) {
   try {
-    // Await params to get the country value
     const { country } = await params;
+    const { searchParams } = new URL(request.url);
+
+    // Extract filter parameters
+    const category = searchParams.get("category");
+    const language = searchParams.get("language") || "en";
+    const source = searchParams.get("source");
+    const fromDate = searchParams.get("from");
+    const toDate = searchParams.get("to");
+
     const apiKey = process.env.NEWS_API_KEY;
 
     if (!apiKey) {
@@ -13,11 +22,23 @@ export async function GET(request, { params }) {
       );
     }
 
-    console.log(`Fetching news for country: ${country}`);
+    // Connect to MongoDB
+    const client = await clientPromise;
+    const db = client.db("news-app");
+    const newsCollection = db.collection("news");
 
-    // Fetch top headlines
-    const url = `https://newsapi.org/v2/top-headlines?country=${country}&apiKey=${apiKey}`;
+    // Build NewsAPI URL with filters
+    let url = `https://newsapi.org/v2/top-headlines?country=${country}&apiKey=${apiKey}`;
 
+    if (category && category !== "all") url += `&category=${category}`;
+    if (language) url += `&language=${language}`;
+    if (source) url += `&sources=${source}`;
+    if (fromDate) url += `&from=${fromDate}`;
+    if (toDate) url += `&to=${toDate}`;
+
+    console.log("Fetching from NewsAPI:", url);
+
+    // Fetch from NewsAPI
     const response = await fetch(url);
 
     if (!response.ok) {
@@ -31,48 +52,72 @@ export async function GET(request, { params }) {
 
     const data = await response.json();
 
-    // Use a simple category detection based on source name
-    const getCategoryFromSource = (sourceName) => {
-      const name = sourceName?.toLowerCase() || "";
+    // Store articles in MongoDB - COUNT ONLY NEW ONES
+    let freshArticlesSaved = 0;
 
-      if (
-        name.includes("sport") ||
-        name.includes("espn") ||
-        name.includes("nfl") ||
-        name.includes("nba")
-      )
-        return "sports";
-      if (
-        name.includes("tech") ||
-        name.includes("wired") ||
-        name.includes("verge")
-      )
-        return "technology";
-      if (
-        name.includes("business") ||
-        name.includes("bloomberg") ||
-        name.includes("financial")
-      )
-        return "business";
-      if (name.includes("health") || name.includes("medical")) return "health";
-      if (name.includes("science")) return "science";
-      if (name.includes("entertainment") || name.includes("hollywood"))
-        return "entertainment";
+    for (const article of data.articles || []) {
+      try {
+        // Check if article already exists
+        const existingArticle = await newsCollection.findOne({
+          url: article.url,
+        });
 
-      return "general";
-    };
+        if (!existingArticle) {
+          const newsDoc = {
+            title: article.title,
+            description: article.description,
+            content: article.content,
+            url: article.url,
+            urlToImage: article.urlToImage,
+            publishedAt: new Date(article.publishedAt),
+            source: article.source,
+            author: article.author,
+            category: category || "general",
+            country: country,
+            language: language,
+            fetchedAt: new Date(),
+          };
 
-    // Enhance articles with estimated category
-    const enhancedArticles =
-      data.articles?.map((article) => ({
-        ...article,
-        category: getCategoryFromSource(article.source?.name),
-      })) || [];
+          await newsCollection.insertOne(newsDoc);
+          freshArticlesSaved++; // Only increment for NEW articles
+          console.log(`✅ Saved new article: ${article.title}`);
+        } else {
+          console.log(`⏭️  Article already exists: ${article.title}`);
+        }
+      } catch (saveError) {
+        console.error("Error saving article:", saveError);
+        // Continue with next article
+      }
+    }
+
+    console.log(`📊 Total new articles saved: ${freshArticlesSaved}`);
+
+    // Build MongoDB query for filtering saved articles
+    const dbQuery = { country };
+
+    if (category && category !== "all") dbQuery.category = category;
+    if (language) dbQuery.language = language;
+    if (source) dbQuery["source.id"] = source;
+
+    if (fromDate || toDate) {
+      dbQuery.publishedAt = {};
+      if (fromDate) dbQuery.publishedAt.$gte = new Date(fromDate);
+      if (toDate) dbQuery.publishedAt.$lte = new Date(toDate);
+    }
+
+    // Get filtered articles from database
+    const dbArticles = await newsCollection
+      .find(dbQuery)
+      .sort({ publishedAt: -1 })
+      .limit(100)
+      .toArray();
 
     return NextResponse.json({
       success: true,
-      articles: enhancedArticles,
-      totalResults: data.totalResults || 0,
+      articles: dbArticles,
+      totalResults: dbArticles.length,
+      source: "database",
+      freshArticlesSaved: freshArticlesSaved, // Now only shows truly NEW articles
     });
   } catch (error) {
     console.error("Error in news API route:", error);
